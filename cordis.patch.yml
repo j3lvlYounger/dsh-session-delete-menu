@@ -1,0 +1,3 @@
+- insert:
+    - id: session-delete-menu
+      name: dsh-session-delete-menu
