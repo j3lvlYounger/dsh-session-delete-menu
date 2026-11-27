@@ -1,11 +1,15 @@
 window.__ModuleLoader__.load({
   id: 'dsh-session-delete-menu',
   factory: () => {
-    const prefix = '/api/session-delete'
-    const entryPattern = /^\d{8}-\d{6}-[A-Za-z0-9._~-]{1,224}$/
+    const endpoint = '/api/dsh-session-delete-menu'
     const errors = {
       RUNNING: '会话仍在运行，等它结束后再删除。',
-      NOT_FOUND: '会话已经不存在。可在回收站查看。',
+      NOT_FOUND: '会话已经不存在。请刷新会话列表。',
+      UNSUPPORTED: '当前会话存储格式不支持永久删除。',
+      UNSAFE_PATH: '无法安全定位会话文件，未删除。',
+      CHANGED: '会话正在变化，未完成删除。请稍后重试。',
+      BUSY: '另一项删除正在进行，请稍后重试。',
+      INCOMPLETE: '未确认永久删除完成，请检查会话后再决定是否重试。',
       INVALID_ID: '此会话标识不可安全删除。',
     }
 
@@ -51,6 +55,48 @@ window.__ModuleLoader__.load({
         let inFlight = false
         let cancelDialog
         const menus = ctx.contextMenus
+        const sessions = ctx.sessions
+        const removed = new Set()
+
+        async function request(input) {
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-dsh-plugin': 'session-delete-menu' },
+            credentials: 'same-origin',
+            redirect: 'error',
+            cache: 'no-store',
+            body: JSON.stringify(input),
+          })
+          return { ok: res.ok, data: await res.json().catch(() => null) }
+        }
+
+        // A successful delete can leave an idle Session in the Host's memory
+        // until its owning Agent releases it. Baseline reloads must not put
+        // that removed item back in the sidebar or the archive view.
+        let queued = false
+        function hideRemoved() {
+          if (queued || disposed || !removed.size) return
+          queued = true
+          queueMicrotask(() => {
+            queued = false
+            if (disposed) return
+            const byId = sessions.list.getSnapshot()?.byId
+            for (const id of removed) {
+              if (byId?.[id] && byId[id].origin !== 'subagent') sessions.handleSessionRemoved?.(id)
+            }
+          })
+        }
+        async function synchronizeRemoved() {
+          try {
+            const { ok, data } = await request({ status: true })
+            if (!ok || disposed || !Array.isArray(data?.removed)) return
+            for (const id of data.removed) if (typeof id === 'string') removed.add(id)
+            hideRemoved()
+          } catch {}
+        }
+        const unsubscribe = sessions.list.subscribe?.(hideRemoved)
+        const disconnect = ctx.on?.('connection/reset', synchronizeRemoved)
+        void synchronizeRemoved()
 
         function confirmPermanentDelete(title) {
           return new Promise((resolve) => {
@@ -70,29 +116,17 @@ window.__ModuleLoader__.load({
               dialog.showModal()
             } catch {
               settle(false)
-              if (!disposed) menus.notify('无法显示删除确认框，请从设置的会话管理页重试。', false)
+              if (!disposed) menus.notify('无法显示删除确认框，请重新打开会话菜单。', false)
             }
           })
         }
 
         function refreshSessions() {
           try {
-            Promise.resolve(ctx.sessions?.refresh?.()).catch(() => {})
+            Promise.resolve(sessions.refresh?.()).catch(() => {})
           } catch {
             // The Host also broadcasts removal; this refresh is opportunistic.
           }
-        }
-
-        async function post(action, body) {
-          const res = await fetch(prefix + '/' + action, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', 'x-dsh-plugin': 'session-delete' },
-            credentials: 'same-origin',
-            redirect: 'error',
-            body: JSON.stringify(body),
-          })
-          const data = await res.json().catch(() => null)
-          return { ok: res.ok && data?.ok === true, data }
         }
 
         async function erase(id, title) {
@@ -100,51 +134,24 @@ window.__ModuleLoader__.load({
           inFlight = true
           try {
             if (!await confirmPermanentDelete(title) || disposed) return
-            const { ok, data } = await post('delete', { id })
-            if (!ok || data.id !== id) {
-              const code = data?.error?.code
-              const message = Object.hasOwn(errors, code) ? errors[code] : null
-              if (!disposed) menus.notify(message ?? '未确认删除成功。请检查会话和回收站，再决定是否重试。', false)
-              return
-            }
-
-            // Purge only the entries returned by this exact operation; never
-            // purge all. A failed purge leaves a recoverable entry and must
-            // never be reported as a completed permanent deletion.
-            const children = Array.isArray(data.cascade?.deleted) ? data.cascade.deleted : []
-            const skipped = Array.isArray(data.cascade?.skippedRunning) ? data.cascade.skippedRunning.length : 0
-            const failed = Array.isArray(data.cascade?.failed) ? data.cascade.failed.length : 0
-            const staged = new Set()
-            let notPurged = 0
-            for (const candidate of [data, ...children]) {
-              const entry = candidate?.entry
-              if (typeof entry === 'string' && entryPattern.test(entry)) staged.add(entry)
-              else if (candidate?.note !== 'dir-missing'
-                       && !(children.includes(candidate) && entry === null)) notPurged++
-            }
-            for (const entry of staged) {
-              try {
-                const result = await post('purge', { entry })
-                if (!result.ok || result.data.count !== 1) notPurged++
-              } catch {
-                notPurged++
-              }
-            }
-
+            const { ok, data } = await request({ id })
             if (disposed) return
-            refreshSessions()
-            if (notPurged) {
-              menus.notify('永久删除未全部完成：请到“设置 → 归档会话 → 回收站”检查剩余条目。', false)
+            if (!ok || data?.ok !== true || data.id !== id) {
+              if (data?.code === 'NOT_FOUND') refreshSessions()
+              const message = Object.hasOwn(errors, data?.code) ? errors[data.code] : null
+              menus.notify(message ?? '未确认永久删除成功。请检查会话后再决定是否重试。', false)
               return
             }
-            const result = data.note === 'dir-missing' ? '已移除会话；本地无可清除的会话记录。'
-              : children.length ? '会话及 ' + children.length + ' 个子会话已永久删除。'
+            removed.add(id)
+            hideRemoved()
+            const { deletedChildren, runningChildren, failedChildren } = data
+            const result = deletedChildren ? '会话及 ' + deletedChildren + ' 个子会话已永久删除。'
               : '会话已永久删除。'
-            const detail = (skipped ? ' ' + skipped + ' 个仍在运行的子会话已跳过。' : '')
-              + (failed ? ' ' + failed + ' 个子会话未能删除。' : '')
-            menus.notify(result + detail, skipped + failed === 0)
+            const detail = (runningChildren ? ' ' + runningChildren + ' 个仍在运行的子会话已跳过。' : '')
+              + (failedChildren ? ' ' + failedChildren + ' 个子会话未能删除。' : '')
+            menus.notify(result + detail, !runningChildren && !failedChildren)
           } catch {
-            if (!disposed) menus.notify('未确认永久删除成功。请先检查会话和回收站，再决定是否重试。', false)
+            if (!disposed) menus.notify('未确认永久删除成功。请检查会话后再决定是否重试。', false)
           } finally {
             inFlight = false
           }
@@ -171,6 +178,8 @@ window.__ModuleLoader__.load({
         return () => {
           disposed = true
           cancelDialog?.()
+          unsubscribe?.()
+          disconnect?.()
           unregister()
         }
       }, 'session-delete-menu: desktop session action')

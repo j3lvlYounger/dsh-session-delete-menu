@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join as joinPath } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { createDeletion, apply } from '../src/index.js'
 import { runInNewContext } from 'node:vm'
 import test from 'node:test'
 
@@ -22,11 +24,12 @@ class Node {
     this.callbacks.close()
   }
 }
-const rootEntry = '20261125-000000-session-right-clicked'
-const childEntry = '20261125-000000-session-child-ok'
-const fake = ({ protocol = 'dsh-app:', status = 200, response, request, purgeFailure } = {}) => {
+const id = 'session-right-clicked'
+const fake = ({ protocol = 'dsh-app:', status = 200, response, request } = {}) => {
   let provider, exported, stop, unregistered, refreshed = 0
-  const requests = [], notices = []
+  const requests = [], notices = [], suppressed = []
+  const byId = { 'session-blank': { blank: true }, [id]: {} }
+  let listener
   const body = new Node()
   const window = { location: { protocol }, __ModuleLoader__: { load: (reg) => { exported = reg.factory() } } }
   const ctx = {
@@ -36,25 +39,31 @@ const fake = ({ protocol = 'dsh-app:', status = 200, response, request, purgeFai
       notify: (...a) => notices.push(a),
     },
     sessions: {
-      list: { getSnapshot: () => ({ byId: { 'session-blank': { blank: true } } }) },
+      list: {
+        getSnapshot: () => ({ byId }),
+        subscribe: fn => { listener = fn; return () => { listener = undefined } },
+      },
+      handleSessionRemoved(name) { suppressed.push(name); delete byId[name]; listener?.() },
       refresh: () => { refreshed += 1 },
     },
   }
   runInNewContext(bundle, {
-    window,
+    window, queueMicrotask,
     document: { body, createElement: () => new Node() },
     fetch: async (url, options) => {
+      if (JSON.parse(options.body).status === true) {
+        return request ? request(url, options) : { ok: true, json: async () => ({ ok: true, removed: [] }) }
+      }
       requests.push({ url, options })
       if (request) return request(url, options)
-      return url.endsWith('/purge')
-        ? { ok: !purgeFailure, json: async () => purgeFailure ? { ok: false } : { ok: true, count: 1 } }
-        : { ok: status === 200, json: async () => response ?? { ok: true, id: 'session-right-clicked', entry: rootEntry } }
+      return { ok: status === 200, json: async () => response ?? { ok: true, id } }
     },
   })
   exported.apply(ctx)
   return {
     get provider() { return provider }, get unregistered() { return unregistered }, get refreshed() { return refreshed },
-    body, requests, notices, stop: () => stop(),
+    body, requests, notices, suppressed, stop: () => stop(),
+    reloadRow(name) { byId[name] = {}; listener?.() },
     open() { return provider.resolve({ sessionId: 'session-right-clicked', displayTitle: '<text only>' })[0].run() },
     button(i) { return body.children.at(-1).children[2].children[i] },
   }
@@ -83,7 +92,7 @@ test('cancel and Escape do not call the Host', async () => {
   assert.ok(app.body.children.every((n) => n.removed))
 })
 
-test('confirm stages exact captured session and permanently purges only its entry', async () => {
+test('confirm sends only the captured session to the standalone backend', async () => {
   const app = fake()
   const done = app.open()
   await app.open()
@@ -91,58 +100,33 @@ test('confirm stages exact captured session and permanently purges only its entr
   assert.match(app.body.children[0].children[1].textContent, /<text only>/)
   app.button(1).callbacks.click()
   await done
-  assert.equal(app.requests.length, 2)
-  assert.deepEqual(app.requests.map(r => r.url), ['/api/session-delete/delete', '/api/session-delete/purge'])
-  for (const { options } of app.requests) {
-    assert.equal(options.method, 'POST')
-    assert.equal(options.headers['x-dsh-plugin'], 'session-delete')
-    assert.equal(options.redirect, 'error')
-  }
-  assert.deepEqual(JSON.parse(app.requests[0].options.body), { id: 'session-right-clicked' })
-  assert.deepEqual(JSON.parse(app.requests[1].options.body), { entry: rootEntry })
+  assert.equal(app.requests.length, 1)
+  const [{ url, options }] = app.requests
+  assert.equal(url, '/api/dsh-session-delete-menu')
+  assert.equal(options.method, 'POST')
+  assert.equal(options.headers['x-dsh-plugin'], 'session-delete-menu')
+  assert.equal(options.redirect, 'error')
+  assert.deepEqual(JSON.parse(options.body), { id })
   assert.match(app.body.children[0].children[1].textContent, /无法恢复/)
-  assert.equal(app.refreshed, 1)
+  assert.equal(app.refreshed, 0)
+  assert.deepEqual(app.suppressed, [id])
+  app.reloadRow(id)
+  app.reloadRow('another-session')
+  await Promise.resolve()
+  assert.deepEqual(app.suppressed, [id, id])
   assert.deepEqual(app.notices, [['会话已永久删除。', true]])
 })
 
-test('running session is kept; partial cascades do not report unconditional success', async () => {
-  const running = fake({ status: 409, response: { error: { code: 'RUNNING' } } })
-  const refused = running.open()
-  running.button(1).callbacks.click()
-  await refused
-  assert.equal(running.refreshed, 0)
-  assert.match(running.notices[0][0], /仍在运行/)
-  assert.equal(running.notices[0][1], false)
-  const partial = fake({ response: { ok: true, id: 'session-right-clicked', entry: rootEntry, cascade: {
-    deleted: [{ id: 'child-ok', entry: childEntry }], skippedRunning: ['child-busy'], failed: [{ id: 'child-error' }],
-  } } })
-  const done = partial.open()
-  partial.button(1).callbacks.click()
-  await done
-  assert.match(partial.notices[0][0], /1 个子会话已永久删除.*1 个仍在运行.*1 个子会话未能/)
-  assert.equal(partial.notices[0][1], false)
-  assert.deepEqual(partial.requests.slice(1).map(r => JSON.parse(r.options.body)), [
-    {entry: rootEntry}, {entry: childEntry},
-  ])
-})
-
-test('a failed purge is not reported as a permanent delete', async () => {
-  const app = fake({ purgeFailure: true })
-  const done = app.open()
-  app.button(1).callbacks.click()
-  await done
-  assert.equal(app.requests.length, 2)
-  assert.match(app.notices[0][0], /永久删除未全部完成/)
-  assert.equal(app.notices[0][1], false)
-})
-
-test('malformed staged entries are never sent to purge', async () => {
-  const app = fake({ response: { ok: true, id: 'session-right-clicked', entry: '../bad' } })
-  const done = app.open()
-  app.button(1).callbacks.click()
-  await done
-  assert.equal(app.requests.length, 1)
-  assert.equal(app.notices[0][1], false)
+test('running session and incomplete removal do not report success', async () => {
+  for (const [code, expected] of [['RUNNING', /仍在运行/], ['INCOMPLETE', /未确认永久删除完成/]]) {
+    const app = fake({ status: 409, response: { ok: false, code } })
+    const blocked = app.open()
+    app.button(1).callbacks.click()
+    await blocked
+    assert.equal(app.refreshed, 0)
+    assert.match(app.notices[0][0], expected)
+    assert.equal(app.notices[0][1], false)
+  }
 })
 
 test('unloading dismisses open confirmation without deletion', async () => {
@@ -155,63 +139,139 @@ test('unloading dismisses open confirmation without deletion', async () => {
   assert.equal(app.body.children[0].removed, true)
 })
 
-const installedBackend = process.env.DSH_TEST_DELETION_BACKEND
-  ?? joinPath(homedir(), '.dsh/profiles/desktop/node_modules/dsh-session-delete/src/index.js')
+const route = '/api/dsh-session-delete-menu'
+const request = (input, header = 'session-delete-menu') => new Request('http://localhost' + route, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-dsh-plugin': header },
+  body: JSON.stringify(input),
+})
 
-test('installed backend removes selected parent and child, preserves unrelated trash',
-  { skip: !existsSync(installedBackend) }, async () => {
-  const { mkdtemp, mkdir, writeFile, readdir, rm, stat } = await import('node:fs/promises')
-  const { basename, dirname, join } = await import('node:path')
-  const { homedir } = await import('node:os')
-  const { pathToFileURL, fileURLToPath } = await import('node:url')
-  const root = await mkdtemp(fileURLToPath(new URL('./sandbox-', import.meta.url)))
-  const plugin = process.env.DSH_TEST_DELETION_BACKEND ?? join(homedir(), '.dsh/profiles/desktop/node_modules/dsh-session-delete/src/index.js')
-  const live = join(root, 'sessions', 'example')
-  const trash = join(root, 'trash', 'sessions')
-  const existing = '20261125-000000-unrelated-entry'
-  const parent = { id: 'session-right-clicked', cwd: root }
-  const child = { id: 'session-example-child', cwd: root, parentSession: parent.id }
-  const unrelated = { id: 'session-other-live', cwd: root }
-  const headers = [parent, child, unrelated]
-  const loc = (entry) => ({ path: join(live, entry.id, 'session.jsonl.zstd') })
-  try {
-    for (const header of headers) {
-      const f = loc(header).path
-      await mkdir(dirname(f), { recursive: true })
-      await writeFile(f, 'disposable fixture')
-    }
-    await mkdir(join(trash, existing), { recursive: true })
-    await writeFile(join(trash, existing, 'sentinel'), 'unrelated')
-    const { apply } = await import(pathToFileURL(plugin))
-    const routes = new Map()
-    const archives = new Set()
+async function storage(t) {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-delete-test-'))
+  t.after(() => rm(base, { recursive: true, force: true }))
+  const root = join(base, 'sessions')
+  const records = new Map(), live = new Map(), agents = new Map()
+  const leases = [], removed = [], archives = new Set(), foreignWriters = new Set()
+  const dir = name => join(root, 'project', name)
+  async function add(name, fields = {}) {
+    const path = join(dir(name), 'session.v4.jsonl.zstd')
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, 'fixture')
+    records.set(name, { header: { id: name, ...fields }, revision: 'r:1',
+      formatStatus: 'current', location: { kind: 'jsonl', path } })
+  }
+  const stat = async name => {
+    const record = records.get(name)
+    if (!record) return
+    try { await lstat(record.location.path); return record }
+    catch (error) { if (error.code !== 'ENOENT') throw error }
+  }
+  const ctx = {
+    sessionPersistence: { name: 'session-persistence-jsonl', config: { root }, stat,
+      list: async () => [...records.values()],
+      async open(name, mode) {
+        assert.equal(mode, 'write')
+        if (foreignWriters.has(name)) throw Object.assign(new Error(), { name: 'SessionAlreadyOwnedError' })
+        leases.push('open:' + name)
+        return { close: async () => { leases.push('close:' + name) } }
+      },
+    },
+    workspaceRegistry: {
+      get archivedSessionIds() { return [...archives] },
+      archiveSession: async name => { archives.add(name) },
+      unarchiveSession: async name => { archives.delete(name) },
+    },
+    sessions: { get: name => live.get(name), flush: async () => true },
+    agents,
+    waterfall: (_, _params, next) => next(),
+    emit: (kind, name) => { assert.equal(kind, 'api-session/removed'); removed.push(name) },
+  }
+  return { base, dir, add, removed, ctx, records, archives, live, agents, foreignWriters, leases,
+    deletion: createDeletion(ctx) }
+}
+
+test('standalone host and menu delete parent and subagent but preserve fork, other session and existing trash', async t => {
+  const fixture = await storage(t)
+  for (const [name, fields] of [
+    [id], ['child', { origin: 'subagent', parentSession: id }],
+    ['fork', { origin: 'fork', parentSession: id }], ['other'],
+  ]) await fixture.add(name, fields)
+  const trash = join(fixture.base, 'trash')
+  await mkdir(trash)
+  await writeFile(join(trash, 'sentinel'), 'preserve')
+  const app = fake({ request: (url, options) =>
+    fixture.deletion.fetch(new Request('http://localhost' + url, options)) })
+  const done = app.open()
+  app.button(1).callbacks.click()
+  await done
+  assert.deepEqual(app.notices, [['会话及 1 个子会话已永久删除。', true]])
+  assert.deepEqual(fixture.removed, [id, 'child'])
+  assert.deepEqual(fixture.leases, ['open:' + id, 'close:' + id, 'open:child', 'close:child'])
+  assert.deepEqual((await readdir(dirname(fixture.dir(id)))).sort(), ['fork', 'other'])
+  assert.deepEqual((await readdir(fixture.base)).sort(), ['sessions', 'trash'])
+  assert.ok((await lstat(join(trash, 'sentinel'))).isFile())
+  assert.equal(fixture.archives.size, 0)
+})
+
+test('an idle live session is flushed and stays gated, a running child is kept', async t => {
+  const f = await storage(t)
+  await f.add(id)
+  await f.add('busy-child', { origin: 'subagent', parentSession: id })
+  f.live.set(id, { seq: 42 })
+  f.agents.set(id, { status: 'idle' })
+  f.agents.set('busy-child', { status: 'running' })
+  let flushed = false
+  f.ctx.sessions.flush = async session => { assert.strictEqual(session, f.live.get(id)); flushed = true; return true }
+  assert.deepEqual(await (await f.deletion.fetch(request({ id }))).json(), {
+    ok: true, id, deletedChildren: 0, runningChildren: 1, failedChildren: 0,
+  })
+  assert.equal(flushed, true)
+  assert.deepEqual(f.leases, [])
+  assert.ok(f.archives.has(id))
+  assert.deepEqual(await (await f.deletion.fetch(request({ status: true }))).json(), {
+    ok: true, removed: [id],
+  })
+  assert.throws(() => f.deletion.guardUnarchive({ sessionId: id }), /BUSY/)
+  assert.ok((await lstat(f.dir('busy-child'))).isDirectory())
+})
+
+test('foreign owner, malformed request, arbitrary path, and symlink never delete data', async t => {
+  const f = await storage(t)
+  await f.add(id)
+  f.foreignWriters.add(id)
+  for (const [input, header, code] of [
+    [{ id }, 'incorrect', 'FORBIDDEN'], [{ id: '../project' }, undefined, 'INVALID_ID'],
+    [{ id, all: true }, undefined, 'INVALID_ID'], [{ id }, undefined, 'RUNNING'],
+  ]) assert.equal((await (await f.deletion.fetch(request(input, header))).json()).code, code)
+  f.foreignWriters.delete(id)
+  const other = join(f.base, 'other')
+  await mkdir(other)
+  const path = join(other, 'session.v4.jsonl.zstd')
+  await writeFile(path, 'outside')
+  f.records.get(id).location.path = path
+  assert.equal((await (await f.deletion.fetch(request({ id }))).json()).code, 'UNSAFE_PATH')
+  await symlink(other, f.dir('linked'))
+  f.records.set('linked', { header: { id: 'linked' }, location: { kind: 'jsonl', path: join(f.dir('linked'), 'session.v4.jsonl.zstd') } })
+  assert.equal((await (await f.deletion.fetch(request({ id: 'linked' }))).json()).code, 'UNSAFE_PATH')
+  assert.deepEqual(f.removed, [])
+  assert.equal(f.archives.size, 0)
+  assert.ok((await lstat(f.dir(id))).isDirectory())
+  assert.ok((await lstat(path)).isFile())
+})
+
+test('registers only an authenticated exact route on the local Desktop profile', async () => {
+  for (const [profile, remote, expected] of [['desktop', false, true], ['desktop', true, false], ['headless', false, false]]) {
+    let routeSpec, cleanup
     apply({
-      sessionPersistence: { list: async () => headers, locate: loc },
-      workspaceRegistry: { get archivedSessionIds() { return [...archives] }, archiveSession: async id => archives.add(id) },
-      agents: new Map(),
-      get: () => undefined,
-      effect: (fn) => fn(),
-      webServer: { register: (row) => { routes.set(row.path, row.handler) } },
+      get: () => ({ name: profile }),
+      connection: { allowsRemoteAuthorities: remote,
+        fetch: { register: spec => { routeSpec = spec; return async () => {} } } },
+      effect: fn => { cleanup = fn() }, on: () => () => {},
     })
-    const app = fake({ request: async (url, options) => {
-      let status, response
-      await routes.get(url)({
-        method: options.method, headers: options.headers,
-        async *[Symbol.asyncIterator]() { yield Buffer.from(options.body) },
-      }, {
-        writeHead: code => { status = code },
-        end: data => { response = JSON.parse(data) },
-      })
-      return { ok: status === 200, json: async () => response }
-    } })
-    const pending = app.open()
-    app.button(1).callbacks.click()
-    await pending
-    assert.equal(app.notices[0][0], '会话及 1 个子会话已永久删除。', basename(root))
-    assert.deepEqual((await readdir(live)).sort(), [unrelated.id])
-    assert.deepEqual((await readdir(trash)).sort(), [existing, 'audit.log'].sort())
-    assert.ok((await stat(join(trash, existing, 'sentinel'))).isFile())
-  } finally {
-    await rm(root, { recursive: true, force: true })
+    assert.equal(Boolean(routeSpec), expected)
+    if (routeSpec) {
+      assert.equal(routeSpec.path, route)
+      assert.deepEqual(routeSpec.methods, ['POST'])
+      await cleanup()
+    }
   }
 })
